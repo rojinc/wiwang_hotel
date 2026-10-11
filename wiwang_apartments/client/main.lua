@@ -1,20 +1,24 @@
 --[[
     Wiwang Hotel apartments - client
 
-    * registers the 380 room doors with the native door system and keeps them locked / unlocked
-      from the server state
-    * [E] at a door: lock / unlock / knock
-    * [E] inside a room you have access to: stash, wardrobe, keys, furniture, log out
+    * door locks: native door system (this file) or delegated to ox_doorlock / qb-doorlock
+    * doors: ox_target / qb-target options on the door model, or [E] prompts (ox_lib points), or a
+      keybind when ox_doorlock owns the [E] prompt
+    * inside a room you have access to: stash, wardrobe, keys, furniture, log out
+    * reception desk in the lobby: check in, find your room, move out
     * qb-apartments compatible events so qb-spawn / qb-multicharacter can spawn you in your room
 ]]
 local QBCore = exports['qb-core']:GetCoreObject()
+local L = Wiwang.L
 
 -- shared with client/furniture.lua (same Lua environment inside this resource)
 WiwangClient = {
-    rooms = {},   -- roomId -> { locked = bool, furniture = list|nil }  (assigned rooms only)
-    cache = {},   -- roomId -> Rooms.Get() world data for all rooms
-    mine = nil,   -- owner view of my own room (nil when I have none)
-    access = {},  -- roomId -> true for every room I may open (own + keys)
+    rooms = {},     -- roomId -> { locked = bool, furniture = list|nil }  (assigned rooms only)
+    cache = {},     -- roomId -> Rooms.Get() world data for all rooms
+    mine = nil,     -- owner view of my own room (nil when I have none)
+    access = {},    -- roomId -> true for every room I may open (own + keys)
+    lockMode = 'native',
+    target = 'none',
 }
 local S = WiwangClient
 
@@ -22,7 +26,9 @@ local DoorsReady = false
 local Zones = {}       -- roomId -> lib.zones.box (only rooms I can access)
 local CurrentDoor      -- roomId of the door point I am standing at
 local InsideRoom       -- roomId of the accessible room I am standing in
+local AtReception = false
 local HomeBlip
+local InteractionReady = false
 
 for floor = 1, Rooms.Floors do
     for number = 1, #Rooms.Template do
@@ -31,8 +37,12 @@ for floor = 1, Rooms.Floors do
     end
 end
 
+local function running(res)
+    return (GetResourceState(res) or ''):find('start') ~= nil
+end
+
 ---------------------------------------------------------------------------------------------------
--- Doors
+-- Native door system (only when no door-lock resource owns the doors)
 ---------------------------------------------------------------------------------------------------
 
 local function DoorHash(roomId)
@@ -52,6 +62,7 @@ local function ApplyDoor(roomId)
 end
 
 local function RegisterDoors()
+    if S.lockMode ~= 'native' then return end
     for roomId, room in pairs(S.cache) do
         local hash = DoorHash(roomId)
         if not IsDoorRegisteredWithSystem(hash) then
@@ -62,22 +73,29 @@ local function RegisterDoors()
     for roomId in pairs(S.cache) do ApplyDoor(roomId) end
 end
 
+local function UnregisterDoors()
+    if not DoorsReady then return end
+    for roomId in pairs(S.cache) do RemoveDoorFromSystem(DoorHash(roomId)) end
+    DoorsReady = false
+end
+
 ---------------------------------------------------------------------------------------------------
--- Text UI (door prompt has priority over the room prompt)
+-- Text UI (door prompt > reception > room prompt)
 ---------------------------------------------------------------------------------------------------
 
 local function DoorLabel(roomId)
     local room = S.cache[roomId]
     local st = S.rooms[roomId]
-    if not st then return ('[E] %s - vacant'):format(room.label) end
-    return ('[E] %s - %s'):format(room.label, st.locked and 'locked' or 'unlocked')
+    return L('door_prompt', room.label, st and L(st.locked and 'locked' or 'unlocked') or L('vacant'))
 end
 
 local function RefreshTextUI()
     if CurrentDoor then
         lib.showTextUI(DoorLabel(CurrentDoor))
+    elseif AtReception then
+        lib.showTextUI(L('reception_prompt'))
     elseif InsideRoom then
-        lib.showTextUI('[E] ' .. S.cache[InsideRoom].label .. ' menu')
+        lib.showTextUI(L('room_menu_prompt', S.cache[InsideRoom].label))
     else
         lib.hideTextUI()
     end
@@ -93,11 +111,11 @@ local function OpenKeysMenu(roomId)
     local holders = lib.callback.await('wiwang:getKeyHolders', false) or {}
     local options = {
         {
-            title = 'Give a key',
-            description = 'Enter the server id of the player',
+            title = L('give_key'),
+            description = L('give_key_desc'),
             icon = 'plus',
             onSelect = function()
-                local input = lib.inputDialog('Give key to', { { type = 'number', label = 'Player server id', required = true, min = 1 } })
+                local input = lib.inputDialog(L('give_key'), { { type = 'number', label = L('player_id'), required = true, min = 1 } })
                 if input and input[1] then TriggerServerEvent('wiwang:server:giveKey', input[1]) end
             end,
         },
@@ -106,14 +124,14 @@ local function OpenKeysMenu(roomId)
         local h = holders[i]
         options[#options + 1] = {
             title = h.name,
-            description = 'Select to take this key back',
+            description = L('take_key_desc'),
             icon = 'key',
             onSelect = function()
                 TriggerServerEvent('wiwang:server:removeKey', h.citizenid)
             end,
         }
     end
-    lib.registerContext({ id = 'wiwang_keys', title = S.cache[roomId].label .. ' - keys', menu = 'wiwang_room', options = options })
+    lib.registerContext({ id = 'wiwang_keys', title = S.cache[roomId].label .. ' - ' .. L('keys'), menu = 'wiwang_room', options = options })
     lib.showContext('wiwang_keys')
 end
 
@@ -121,31 +139,32 @@ OpenRoomMenu = function(roomId)
     local room = S.cache[roomId]
     local st = S.rooms[roomId]
     local isOwner = S.mine ~= nil and S.mine.id == roomId
+    local locked = st and st.locked
     local options = {
-        { title = 'Stash', icon = 'box-open', onSelect = function() TriggerServerEvent('wiwang:server:openStash', roomId) end },
-        { title = 'Wardrobe', icon = 'shirt', onSelect = function() TriggerEvent(Wiwang.OutfitEvent) end },
+        { title = L('stash'), icon = 'box-open', onSelect = function() TriggerServerEvent('wiwang:server:openStash', roomId) end },
+        { title = L('wardrobe'), icon = 'shirt', onSelect = function() TriggerEvent(Wiwang.OutfitEvent) end },
         {
-            title = (st and st.locked) and 'Unlock door' or 'Lock door',
-            icon = (st and st.locked) and 'lock-open' or 'lock',
-            onSelect = function() TriggerServerEvent('wiwang:server:setLock', roomId, not (st and st.locked)) end,
+            title = L(locked and 'unlock_door' or 'lock_door'),
+            icon = locked and 'lock-open' or 'lock',
+            onSelect = function() TriggerServerEvent('wiwang:server:setLock', roomId, not locked) end,
         },
     }
     if isOwner then
-        options[#options + 1] = { title = 'Keys', description = 'Give or take back keys', icon = 'key', onSelect = function() OpenKeysMenu(roomId) end }
+        options[#options + 1] = { title = L('keys'), description = L('keys_desc'), icon = 'key', onSelect = function() OpenKeysMenu(roomId) end }
         if Wiwang.AllowFurnitureEditing then
-            options[#options + 1] = { title = 'Furniture', description = 'Add, remove or reset props', icon = 'couch', onSelect = function() WiwangClient.OpenFurnitureMenu(roomId) end }
+            options[#options + 1] = { title = L('furniture'), description = L('furniture_desc'), icon = 'couch', onSelect = function() WiwangClient.OpenFurnitureMenu(roomId) end }
         end
         options[#options + 1] = {
-            title = 'Log out',
-            description = 'Back to character selection',
+            title = L('logout'),
+            description = L('logout_desc'),
             icon = 'right-from-bracket',
             onSelect = function()
-                local ok = lib.alertDialog({ header = 'Log out', content = 'Go back to character selection?', centered = true, cancel = true })
+                local ok = lib.alertDialog({ header = L('logout'), content = L('logout_confirm'), centered = true, cancel = true })
                 if ok == 'confirm' then TriggerServerEvent('wiwang:server:logout') end
             end,
         }
     end
-    lib.registerContext({ id = 'wiwang_room', title = room.label .. ' - floor ' .. room.floor, options = options })
+    lib.registerContext({ id = 'wiwang_room', title = room.label .. ' - ' .. L('floor', room.floor), options = options })
     lib.showContext('wiwang_room')
 end
 
@@ -156,24 +175,120 @@ local function OpenDoorMenu(roomId)
     if st then
         if S.access[roomId] then
             options[#options + 1] = {
-                title = st.locked and 'Unlock door' or 'Lock door',
+                title = L(st.locked and 'unlock_door' or 'lock_door'),
                 icon = st.locked and 'lock-open' or 'lock',
                 onSelect = function() TriggerServerEvent('wiwang:server:setLock', roomId, not st.locked) end,
             }
-            options[#options + 1] = { title = 'Room menu', icon = 'house', onSelect = function() OpenRoomMenu(roomId) end }
+            options[#options + 1] = { title = L('room_menu'), icon = 'house', onSelect = function() OpenRoomMenu(roomId) end }
         else
-            options[#options + 1] = { title = 'Knock', icon = 'hand', onSelect = function() TriggerServerEvent('wiwang:server:knock', roomId) end }
+            options[#options + 1] = { title = L('knock'), icon = 'hand', onSelect = function() TriggerServerEvent('wiwang:server:knock', roomId) end }
         end
     else
-        options[#options + 1] = { title = 'Vacant', description = 'Nobody lives here yet', icon = 'door-open', disabled = true }
+        options[#options + 1] = { title = L('vacant_room'), description = L('vacant_room_desc'), icon = 'door-open', disabled = true }
     end
-    lib.registerContext({ id = 'wiwang_door', title = room.label .. ' - floor ' .. room.floor, options = options })
+    lib.registerContext({ id = 'wiwang_door', title = room.label .. ' - ' .. L('floor', room.floor), options = options })
     lib.showContext('wiwang_door')
 end
 
+local function OpenReceptionMenu()
+    local options = {}
+    if S.mine then
+        options[#options + 1] = {
+            title = L('my_room'),
+            description = L('my_room_desc', S.mine.label, S.mine.floor),
+            icon = 'location-dot',
+            onSelect = function() TriggerEvent('wiwang:client:showRoom', S.mine) end,
+        }
+        if Wiwang.AllowMoveOut then
+            options[#options + 1] = {
+                title = L('move_out'),
+                description = L('move_out_desc', S.mine.label),
+                icon = 'person-walking-arrow-right',
+                onSelect = function()
+                    local warning = Wiwang.ClearStashOnUnassign and L('move_out_stash_warning') or ''
+                    local ok = lib.alertDialog({ header = L('move_out'), content = L('move_out_confirm', S.mine.label, warning), centered = true, cancel = true })
+                    if ok == 'confirm' then TriggerServerEvent('wiwang:server:moveOut') end
+                end,
+            }
+        end
+    else
+        options[#options + 1] = { title = L('check_in'), description = L('check_in_desc'), icon = 'bell-concierge', onSelect = function() TriggerServerEvent('wiwang:server:checkIn') end }
+    end
+    lib.registerContext({ id = 'wiwang_reception', title = L('hotel') .. ' - ' .. L('reception'), options = options })
+    lib.showContext('wiwang_reception')
+end
+
 ---------------------------------------------------------------------------------------------------
--- Door interaction points (one per room, ox_lib only checks them every few hundred ms)
+-- Door interaction: target options, [E] points, or a keybind
 ---------------------------------------------------------------------------------------------------
+
+local function RoomFromEntity(entity)
+    if not entity or entity == 0 then return nil end
+    return Rooms.Nearest(GetEntityCoords(entity), 0.6)
+end
+
+local function ResolveTarget()
+    local want = Wiwang.Target
+    if want == 'auto' then
+        return running('ox_target') and 'ox_target' or running('qb-target') and 'qb-target' or 'none'
+    end
+    if want ~= 'none' and not running(want) then return 'none' end
+    return want
+end
+
+local function TargetOptions()
+    local function access(entity) local r = RoomFromEntity(entity); return r and S.access[r.id] == true end
+    local function assigned(entity) local r = RoomFromEntity(entity); return r and S.rooms[r.id] ~= nil end
+    return {
+        {
+            name = 'wiwang_unlock', label = L('unlock_door'), icon = 'fa-solid fa-lock-open',
+            canInteract = function(entity) local r = RoomFromEntity(entity); return r and S.access[r.id] and IsLocked(r.id) end,
+            run = function(entity) local r = RoomFromEntity(entity); if r then TriggerServerEvent('wiwang:server:setLock', r.id, false) end end,
+        },
+        {
+            name = 'wiwang_lock', label = L('lock_door'), icon = 'fa-solid fa-lock',
+            canInteract = function(entity) local r = RoomFromEntity(entity); return r and S.access[r.id] and not IsLocked(r.id) end,
+            run = function(entity) local r = RoomFromEntity(entity); if r then TriggerServerEvent('wiwang:server:setLock', r.id, true) end end,
+        },
+        {
+            name = 'wiwang_menu', label = L('room_menu'), icon = 'fa-solid fa-house',
+            canInteract = access,
+            run = function(entity) local r = RoomFromEntity(entity); if r then OpenRoomMenu(r.id) end end,
+        },
+        {
+            name = 'wiwang_knock', label = L('knock'), icon = 'fa-solid fa-hand',
+            canInteract = function(entity) return assigned(entity) and not access(entity) end,
+            run = function(entity) local r = RoomFromEntity(entity); if r then TriggerServerEvent('wiwang:server:knock', r.id) end end,
+        },
+    }
+end
+
+local function SetupTarget(kind)
+    local opts = TargetOptions()
+    if kind == 'ox_target' then
+        local options = {}
+        for i = 1, #opts do
+            local o = opts[i]
+            options[i] = { name = o.name, label = o.label, icon = o.icon, distance = 2.0, canInteract = o.canInteract, onSelect = function(data) o.run(data.entity) end }
+        end
+        exports.ox_target:addModel(Rooms.DoorModel, options)
+    elseif kind == 'qb-target' then
+        local options = {}
+        for i = 1, #opts do
+            local o = opts[i]
+            options[i] = { label = o.label, icon = o.icon, canInteract = o.canInteract, action = o.run }
+        end
+        exports['qb-target']:AddTargetModel(Rooms.DoorModel, { options = options, distance = 2.0 })
+    end
+end
+
+local function RemoveTarget(kind)
+    if kind == 'ox_target' then
+        pcall(function() exports.ox_target:removeModel(Rooms.DoorModel) end)
+    elseif kind == 'qb-target' then
+        pcall(function() exports['qb-target']:RemoveTargetModel(Rooms.DoorModel) end)
+    end
+end
 
 local function DoorEnter(self)
     CurrentDoor = self.roomId
@@ -191,15 +306,58 @@ local function DoorNearby(self)
     end
 end
 
-for roomId, room in pairs(S.cache) do
-    lib.points.new({
-        coords = room.door,
-        distance = 1.5,
-        roomId = roomId,
-        onEnter = DoorEnter,
-        onExit = DoorExit,
-        nearby = DoorNearby,
+local function SetupDoorPoints()
+    for roomId, room in pairs(S.cache) do
+        lib.points.new({
+            coords = room.door,
+            distance = 1.5,
+            roomId = roomId,
+            onEnter = DoorEnter,
+            onExit = DoorExit,
+            nearby = DoorNearby,
+        })
+    end
+end
+
+local function SetupDoorKeybind()
+    lib.addKeybind({
+        name = 'wiwang_door',
+        description = L('keybind_door'),
+        defaultKey = Wiwang.DoorKeybind,
+        onPressed = function()
+            local room = Rooms.Nearest(GetEntityCoords(cache.ped), 1.8)
+            if room then OpenDoorMenu(room.id) end
+        end,
     })
+end
+
+local function SetupReception()
+    local r = Wiwang.Reception
+    if not r.enabled then return end
+    lib.points.new({
+        coords = r.coords,
+        distance = r.distance,
+        onEnter = function() AtReception = true; RefreshTextUI() end,
+        onExit = function() AtReception = false; RefreshTextUI() end,
+        nearby = function()
+            if not CurrentDoor and IsControlJustReleased(0, Wiwang.InteractKey) then OpenReceptionMenu() end
+        end,
+    })
+end
+
+--- decide once how doors are interacted with (needs the lock mode from the server)
+local function SetupInteraction()
+    if InteractionReady then return end
+    InteractionReady = true
+    S.target = ResolveTarget()
+    if S.target ~= 'none' then
+        SetupTarget(S.target)
+    elseif S.lockMode == 'ox_doorlock' then
+        SetupDoorKeybind() -- ox_doorlock already shows a text UI and uses [E] at these doors
+    else
+        SetupDoorPoints()
+    end
+    SetupReception()
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -223,9 +381,10 @@ local function ZoneExit(self)
 end
 
 local function ZoneInside(self)
-    if not CurrentDoor and IsControlJustReleased(0, Wiwang.InteractKey) then
-        OpenRoomMenu(self.roomId)
-    end
+    if CurrentDoor or not IsControlJustReleased(0, Wiwang.InteractKey) then return end
+    -- ox_doorlock toggles the lock with [E] near the door: keep the room menu away from it
+    if S.lockMode == 'ox_doorlock' and #(GetEntityCoords(cache.ped) - S.cache[self.roomId].door) < 2.2 then return end
+    OpenRoomMenu(self.roomId)
 end
 
 local function RebuildZones()
@@ -295,11 +454,17 @@ end
 ---------------------------------------------------------------------------------------------------
 
 local function Init()
-    local rooms, mine, access = lib.callback.await('wiwang:getState', false)
+    local rooms, mine, access, lockMode = lib.callback.await('wiwang:getState', false)
     S.rooms = rooms or {}
     S.mine = mine or nil
     S.access = access or {}
-    if not DoorsReady then RegisterDoors() else for roomId in pairs(S.cache) do ApplyDoor(roomId) end end
+    S.lockMode = lockMode or 'native'
+    if S.lockMode == 'native' then
+        if DoorsReady then for roomId in pairs(S.cache) do ApplyDoor(roomId) end else RegisterDoors() end
+    else
+        UnregisterDoors()
+    end
+    SetupInteraction()
     RebuildZones()
     UpdateBlip()
     WiwangClient.DespawnAll()
@@ -353,15 +518,23 @@ RegisterNetEvent('wiwang:client:openOldStash', function(stash, data)
     TriggerServerEvent('inventory:server:OpenInventory', 'stash', stash, data)
 end)
 
+--- someone knocked on my door: offer to open it for a while
+RegisterNetEvent('wiwang:client:knock', function(roomId)
+    local room = S.cache[roomId]
+    if not room then return end
+    local ok = lib.alertDialog({
+        header = L('knock_title'),
+        content = L('knock_body', room.label, Wiwang.KnockOpenTime),
+        centered = true,
+        cancel = true,
+    })
+    if ok == 'confirm' then TriggerServerEvent('wiwang:server:openForVisitor', roomId) end
+end)
+
 RegisterNetEvent('wiwang:client:showRoom', function(mine)
     local loc = Apartments.Locations[Wiwang.ApartmentType]
     SetNewWaypoint(loc.coords.enter.x, loc.coords.enter.y)
-    lib.notify({
-        title = 'Wiwang Hotel',
-        description = ('%s on floor %d. Take the elevator in the lobby (waypoint set).'):format(mine.label, mine.floor),
-        type = 'inform',
-        duration = 8000,
-    })
+    lib.notify({ title = L('hotel'), description = L('room_hint', mine.label, mine.floor), type = 'inform', duration = 8000 })
 end)
 
 ---------------------------------------------------------------------------------------------------
@@ -412,23 +585,28 @@ RegisterCommand('roomfurni', function()
     if S.mine and InsideRoom == S.mine.id and Wiwang.AllowFurnitureEditing then
         WiwangClient.OpenFurnitureMenu(S.mine.id)
     else
-        lib.notify({ type = 'error', description = 'Stand inside your own room first' })
+        lib.notify({ type = 'error', description = L('furni_not_inside') })
     end
 end, false)
 
 ---------------------------------------------------------------------------------------------------
--- Start / stop
+-- Exports / start / stop
 ---------------------------------------------------------------------------------------------------
+
+exports('GetMyRoom', function() return S.mine end)
+exports('GetRoomAt', function(coords) return Rooms.Nearest(coords or GetEntityCoords(cache.ped), 1.8) end)
+exports('OpenRoomMenu', function(roomId) OpenRoomMenu(roomId) end)
+exports('OpenDoorMenu', function(roomId) OpenDoorMenu(roomId) end)
 
 CreateThread(function()
     Wait(0) -- let client/furniture.lua load first
-    RegisterDoors()
     if LocalPlayer.state.isLoggedIn then Init() end
 end)
 
 AddEventHandler('onResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
-    for roomId in pairs(S.cache) do RemoveDoorFromSystem(DoorHash(roomId)) end
+    UnregisterDoors()
+    RemoveTarget(S.target)
     for _, zone in pairs(Zones) do zone:remove() end
     lib.hideTextUI()
     if HomeBlip then RemoveBlip(HomeBlip) end

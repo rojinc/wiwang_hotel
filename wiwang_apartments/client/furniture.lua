@@ -6,6 +6,7 @@
     Everybody nearby sees the same furniture because everybody spawns it from the same server data.
 ]]
 local S = WiwangClient
+local L = Wiwang.L
 
 local Spawned = {}      -- roomId -> { object handles }
 local CurrentFloor      -- floor the local player is currently on (nil = not in the hotel)
@@ -95,28 +96,28 @@ function WiwangClient.OpenFurnitureMenu(roomId)
     local list = EffectiveList(roomId) or {}
     local options = {
         {
-            title = 'Add a prop here',
-            description = 'Placed 1 m in front of you, on the floor',
+            title = L('furni_add'),
+            description = L('furni_add_desc'),
             icon = 'plus',
             onSelect = function()
-                local input = lib.inputDialog('Add furniture', {
-                    { type = 'input', label = 'Prop model', description = 'e.g. prop_tv_flat_01', required = true },
-                    { type = 'number', label = 'Height above floor (m)', default = 0, step = 0.05 },
-                    { type = 'number', label = 'Extra rotation (degrees)', default = 0 },
+                local input = lib.inputDialog(L('furni_add'), {
+                    { type = 'input', label = L('furni_model'), description = L('furni_model_desc'), required = true },
+                    { type = 'number', label = L('furni_height'), default = 0, step = 0.05 },
+                    { type = 'number', label = L('furni_rotate'), default = 0 },
                 })
                 if not input then return end
                 local model = tostring(input[1])
                 if not IsModelInCdimage(joaat(model)) then
-                    return lib.notify({ type = 'error', description = 'Unknown prop model: ' .. model })
+                    return lib.notify({ type = 'error', description = L('furni_unknown', model) })
                 end
                 local ped = cache.ped
                 local pos = GetOffsetFromEntityInWorldCoords(ped, 0.0, 1.0, 0.0)
                 local x, y, _, h = Rooms.ToLocal(room, vec3(pos.x, pos.y, room.centre.z), GetEntityHeading(ped))
                 if math.abs(x) > 3.3 or math.abs(y) > 3.0 then
-                    return lib.notify({ type = 'error', description = 'That spot is outside the room' })
+                    return lib.notify({ type = 'error', description = L('furni_outside') })
                 end
                 if #list >= Wiwang.MaxFurniture then
-                    return lib.notify({ type = 'error', description = 'Room is full (' .. Wiwang.MaxFurniture .. ' props)' })
+                    return lib.notify({ type = 'error', description = L('furni_full', Wiwang.MaxFurniture) })
                 end
                 local new = {}
                 for i = 1, #list do new[i] = list[i] end
@@ -125,7 +126,7 @@ function WiwangClient.OpenFurnitureMenu(roomId)
             end,
         },
         {
-            title = 'Remove the nearest prop',
+            title = L('furni_remove'),
             icon = 'minus',
             onSelect = function()
                 local ped = GetEntityCoords(cache.ped)
@@ -135,7 +136,7 @@ function WiwangClient.OpenFurnitureMenu(roomId)
                     local dist = #(ped - pos)
                     if dist < 3.0 and (not bestDist or dist < bestDist) then best, bestDist = i, dist end
                 end
-                if not best then return lib.notify({ type = 'error', description = 'No prop within 3 m' }) end
+                if not best then return lib.notify({ type = 'error', description = L('furni_none_near') }) end
                 local new = {}
                 for i = 1, #list do
                     if i ~= best then new[#new + 1] = list[i] end
@@ -144,12 +145,12 @@ function WiwangClient.OpenFurnitureMenu(roomId)
             end,
         },
         {
-            title = 'Reset to default',
+            title = L('furni_reset'),
             icon = 'rotate-left',
             onSelect = function() TriggerServerEvent('wiwang:server:resetFurniture') end,
         },
-        { title = ('%d / %d props'):format(#list, Wiwang.MaxFurniture), icon = 'couch', disabled = true },
+        { title = L('furni_count', #list, Wiwang.MaxFurniture), icon = 'couch', disabled = true },
     }
-    lib.registerContext({ id = 'wiwang_furniture', title = room.label .. ' - furniture', menu = 'wiwang_room', options = options })
+    lib.registerContext({ id = 'wiwang_furniture', title = room.label .. ' - ' .. L('furniture'), menu = 'wiwang_room', options = options })
     lib.showContext('wiwang_furniture')
 end

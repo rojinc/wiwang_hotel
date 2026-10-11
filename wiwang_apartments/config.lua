@@ -25,15 +25,35 @@ Wiwang = {}
 Wiwang.ApartmentType = 'wiwang'      -- key of Apartments.Locations above
 Wiwang.AutoAssignOnLoad = true       -- give every character a free room the first time they load (works without qb-spawn too)
 Wiwang.AssignOrder = 'floor'         -- 'floor' = fill the lowest floors first | 'random'
-Wiwang.LockVacantRooms = false       -- true = rooms nobody owns are locked as well
+Wiwang.LockVacantRooms = false       -- true = rooms nobody owns are locked as well (native and qb-doorlock modes only)
+Wiwang.AllowMoveOut = true           -- players can give their room back at the reception
 Wiwang.Inventory = 'auto'            -- 'auto' | 'qb-inventory' | 'qb-inventory-old' | 'ox_inventory'
 Wiwang.StashSlots = 50
 Wiwang.StashWeight = 100000
-Wiwang.ClearStashOnUnassign = true   -- wipe the room stash when an admin unassigns it (next tenant starts empty)
+Wiwang.ClearStashOnUnassign = true   -- wipe the room stash when a room is freed (next tenant starts empty)
 Wiwang.OutfitEvent = 'qb-clothing:client:openOutfitMenu' -- illenium-appearance: 'illenium-appearance:client:openOutfitMenu'
-Wiwang.InteractKey = 38              -- E
 Wiwang.Blip = { sprite = 475, colour = 3, scale = 0.7 }
 Wiwang.AdminPermission = 'admin'     -- qb-core permission for the /wiwang_* admin commands
+
+-- Door locks -------------------------------------------------------------------------------------
+-- 'auto' picks ox_doorlock, then qb-doorlock, then the built-in native door system.
+--  * native      : this resource registers the 380 doors itself (no extra resource needed)
+--  * ox_doorlock : one ox_doorlock door per assigned room is created/removed automatically; owner and
+--                  key holders are authorised through ox_doorlock's doorAuthorization hook, so its own
+--                  [E] prompt, sounds and lockpick settings all work. Vacant rooms have no door entry.
+--  * qb-doorlock : copy doorlock/qb-doorlock/wiwang_hotel.lua into qb-doorlock/configs/. Lock state is
+--                  driven by this resource (owner / keys), qb-doorlock handles the door itself.
+Wiwang.DoorLock = 'auto'             -- 'auto' | 'native' | 'ox_doorlock' | 'qb-doorlock'
+
+-- Interaction ------------------------------------------------------------------------------------
+-- 'auto' uses ox_target, then qb-target (options on the door model), otherwise [E] prompts via ox_lib.
+Wiwang.Target = 'auto'               -- 'auto' | 'ox_target' | 'qb-target' | 'none'
+Wiwang.InteractKey = 38              -- E: door prompt (native / qb-doorlock without target) and room menu inside the room
+Wiwang.DoorKeybind = 'G'             -- used for the door menu when ox_doorlock owns the [E] prompt and no target resource is running
+Wiwang.KnockOpenTime = 15            -- seconds the door stays open after the owner accepts a knock (0 = no prompt, just a notification)
+
+-- Reception desk in the lobby: check in (get a room), find your room, move out
+Wiwang.Reception = { enabled = true, coords = vector3(-824.2, -699.7, 28.0), distance = 2.5 }
 
 -- Rendering --------------------------------------------------------------------------------------
 -- Furniture is NOT networked. Each client spawns the props of the rooms on ITS OWN floor that are

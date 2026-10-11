@@ -80,6 +80,7 @@ function Rooms.Get(floor, number)
         bbMax = base + t.bbMax,
         centre = base + t.centre,                  -- z = floor level
         door = door,                               -- door entity origin (for AddDoorToSystem / interaction point)
+        doorHeading = (90.0 + t.rotation) % 360.0, -- heading of the door entity
         spawn = vec4(door.x + ix, door.y + iy, base.z + t.bbMin.z, (270.0 + t.rotation) % 360.0),
         detail = base + t.detail,
     }
@@ -114,4 +115,20 @@ function Rooms.FloorAt(coords)
     local floor = math.floor(rel / Rooms.FloorHeight) + 1
     if floor > Rooms.Floors then return nil end
     return floor
+end
+
+--- Nearest room door to `coords` on that floor (nil when none within maxDist metres)
+---@return table|nil room, number|nil distance
+function Rooms.Nearest(coords, maxDist)
+    local floor = Rooms.FloorAt(coords)
+    if not floor then return nil end
+    local best, bestDist
+    for number = 1, #Rooms.Template do
+        local t = Rooms.Template[number]
+        local dx, dy = coords.x - (Rooms.Base.x + t.door.x), coords.y - (Rooms.Base.y + t.door.y)
+        local dist = math.sqrt(dx * dx + dy * dy)
+        if dist <= maxDist and (not bestDist or dist < bestDist) then best, bestDist = number, dist end
+    end
+    if not best then return nil end
+    return Rooms.Get(floor, best), bestDist
 end

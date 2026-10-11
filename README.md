@@ -18,7 +18,8 @@
 **Apartments (qb-core)**
 
 The `wiwang_apartments` resource turns the 380 real rooms into player apartments
-(qb-apartments replacement): automatic room assignment, lockable door, stash, wardrobe, keys,
+(qb-apartments replacement): automatic room assignment, lockable door (native, ox_doorlock or
+qb-doorlock), ox_target / qb-target support, stash, wardrobe, keys, knock-to-open, lobby reception,
 furniture that is only rendered for rooms near you. See `wiwang_apartments/README.md`.
 
 `tools/mlo_dump.py` dumps rooms, portals and door positions from the `.ytyp` / `.ymap` files
