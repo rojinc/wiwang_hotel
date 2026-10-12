@@ -8,7 +8,7 @@ same corridors, knocks on the same doors and sees the same furniture.
 
 | Feature | How |
 |---|---|
-| Room per character | Assigned automatically the first time a character loads (`Wiwang.AutoAssignOnLoad`), at the lobby reception ("Check in"), or through the qb-spawn "pick an apartment" flow for new characters. Lowest floors fill first (`Wiwang.AssignOrder`). |
+| Room per character | Assigned through the qb-spawn "pick an apartment" flow for new characters, at the lobby reception ("Check in"), or automatically `Wiwang.AutoAssignDelay` seconds after a character loads without one (`Wiwang.AutoAssignOnLoad`). Lowest floors fill first (`Wiwang.AssignOrder`). |
 | Locked door | Native door system, **ox_doorlock** or **qb-doorlock** (`Wiwang.DoorLock`, auto-detected). Owner and key holders lock / unlock; others can **knock**. |
 | Knock to open | The owner gets a prompt and can open the door for `Wiwang.KnockOpenTime` seconds; it locks itself again afterwards. |
 | Stash | Per room, from the room menu. qb-inventory (new and old API) and ox_inventory (`Wiwang.Inventory`). |
@@ -53,16 +53,19 @@ same corridors, knocks on the same doors and sees the same furniture.
 | Mode | Setup | Notes |
 |---|---|---|
 | `native` | nothing | This resource registers the 380 doors with the game's door system and keeps them in the server state. `[E]` at a door: lock / unlock / knock. |
-| `ox_doorlock` | nothing (auto when running) | One ox_doorlock door per **assigned** room is created, updated and removed automatically (name = room id). Owner and key holders are authorised through ox_doorlock's `doorAuthorization` hook, so this also works on plain qb-core, which ox_doorlock does not bridge itself. ox_doorlock's own `[E]` prompt, sounds, lockpick settings and admin UI all apply. Because ox_doorlock already uses `[E]` and the text UI at the door, the knock / room-door menu is on a keybind (`Wiwang.DoorKeybind`, default **G**, changeable in the game settings) unless a target resource is running. Vacant rooms have no door entry (always open). |
-| `qb-doorlock` | copy `doorlock/qb-doorlock/wiwang_hotel.lua` into `qb-doorlock/configs/` | Door ids equal the room ids. Nobody is authorised in that file on purpose: this resource flips the state (owner / keys / knock) through `qb-doorlock:server:updateState`. States are pushed again after a restart as soon as a player is online. `[E]` prompts work as in native mode. |
+| `ox_doorlock` | nothing (auto when running) | On first start one ox_doorlock door is created for **every** hotel room (380, name = room id); afterwards only the owner / key list and the state change. Owner and key holders are the door's `characters` **and** are authorised through ox_doorlock's `doorAuthorization` hook, so it works on plain qb-core, which ox_doorlock does not bridge itself. ox_doorlock's own `[E]` prompt, sounds, lockpick settings and admin UI all apply. The **CommunityOx** fork has no `createDoor` export: the rows are inserted into its table instead and the console asks you to restart ox_doorlock once. Because ox_doorlock already uses `[E]` and the text UI at the door, the knock / room-door menu is on a keybind (`Wiwang.DoorKeybind`, default **G**, changeable in the game settings) unless a target resource is running. |
+| `qb-doorlock` | copy `doorlock/qb-doorlock/wiwang_hotel.lua` into `qb-doorlock/configs/` | Door ids equal the room ids. Nobody is authorised in that file on purpose: this resource flips the state (owner / keys / knock) through `qb-doorlock:server:updateState`. States are pushed again after a restart as soon as a player is online. qb-doorlock keeps `[E]` for itself, so the door prompt shows the keybind (**G**) like in ox_doorlock mode. |
 
-`/wiwang_doorlock` (admin) prints the active mode and re-syncs the doors.
+`/wiwang_doorlock` (admin) prints the active mode and re-syncs the doors; `/wiwang_doorlock cleanup`
+deletes the hotel doors from ox_doorlock again (when you switch to another mode). If a door-lock
+resource starts after this one, the switch is picked up automatically and every client is told.
 
 ## Interaction (`Wiwang.Target`)
 
 * `ox_target` / `qb-target` (auto when running): options on the door model itself (Unlock, Lock, Room
   menu, Knock), no `[E]` prompt at doors.
-* otherwise: `[E]` prompt at the door (ox_lib point), or the keybind when ox_doorlock owns `[E]`.
+* otherwise: `[E]` prompt at the door (ox_lib point) in native mode; with ox_doorlock or qb-doorlock
+  the prompt points to the keybind (default **G**) because they use `[E]` themselves.
 * Inside a room you have access to: `[E]` opens the room menu (`Wiwang.InteractKey`).
 * Reception desk: `[E]` at `Wiwang.Reception.coords` (move it if the desk is elsewhere).
 
@@ -85,7 +88,7 @@ every room is a rotated copy of the same layout. The shipped list is a placehold
 | `/wiwang_assign [id] [floor] [room]` | admin | Give a player a room (next free one when floor/room are omitted) |
 | `/wiwang_unassign [id or citizenid or room id]` | admin | Free a room (wipes the stash when `ClearStashOnUnassign`) |
 | `/wiwang_free` | admin | How many rooms are free |
-| `/wiwang_doorlock` | admin | Show the door-lock mode and re-sync doors |
+| `/wiwang_doorlock [cleanup]` | admin | Show the door-lock mode and re-sync doors; `cleanup` removes the hotel doors from ox_doorlock |
 
 ## Exports
 

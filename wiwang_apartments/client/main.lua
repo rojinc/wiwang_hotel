@@ -23,6 +23,10 @@ WiwangClient = {
 local S = WiwangClient
 
 local DoorsReady = false
+local StateLoaded = false
+local DoorPoints = {}  -- lib.points for the door prompts
+local ReceptionPoint
+local DoorKeybind
 local Zones = {}       -- roomId -> lib.zones.box (only rooms I can access)
 local CurrentDoor      -- roomId of the door point I am standing at
 local InsideRoom       -- roomId of the accessible room I am standing in
@@ -37,8 +41,13 @@ for floor = 1, Rooms.Floors do
     end
 end
 
-local function running(res)
-    return (GetResourceState(res) or ''):find('start') ~= nil
+local running = Wiwang.Running
+
+--- which key the door prompt should mention
+local function DoorKeyLabel()
+    if S.lockMode == 'native' then return Wiwang.InteractKeyLabel end
+    local ok, key = pcall(function() return DoorKeybind and DoorKeybind:getCurrentKey() end)
+    return ok and key and key ~= '' and key:upper() or Wiwang.DoorKeybind
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -86,16 +95,16 @@ end
 local function DoorLabel(roomId)
     local room = S.cache[roomId]
     local st = S.rooms[roomId]
-    return L('door_prompt', room.label, st and L(st.locked and 'locked' or 'unlocked') or L('vacant'))
+    return L('door_prompt', DoorKeyLabel(), room.label, st and L(st.locked and 'locked' or 'unlocked') or L('vacant'))
 end
 
 local function RefreshTextUI()
     if CurrentDoor then
         lib.showTextUI(DoorLabel(CurrentDoor))
     elseif AtReception then
-        lib.showTextUI(L('reception_prompt'))
+        lib.showTextUI(L('reception_prompt', Wiwang.InteractKeyLabel))
     elseif InsideRoom then
-        lib.showTextUI(L('room_menu_prompt', S.cache[InsideRoom].label))
+        lib.showTextUI(L('room_menu_prompt', Wiwang.InteractKeyLabel, S.cache[InsideRoom].label))
     else
         lib.hideTextUI()
     end
@@ -300,15 +309,16 @@ local function DoorExit(self)
     RefreshTextUI()
 end
 
+--- [E] opens the door menu only in native mode; ox_doorlock / qb-doorlock use [E] themselves
 local function DoorNearby(self)
-    if IsControlJustReleased(0, Wiwang.InteractKey) then
+    if S.lockMode == 'native' and IsControlJustReleased(0, Wiwang.InteractKey) then
         OpenDoorMenu(self.roomId)
     end
 end
 
 local function SetupDoorPoints()
     for roomId, room in pairs(S.cache) do
-        lib.points.new({
+        DoorPoints[#DoorPoints + 1] = lib.points.new({
             coords = room.door,
             distance = 1.5,
             roomId = roomId,
@@ -320,11 +330,16 @@ local function SetupDoorPoints()
 end
 
 local function SetupDoorKeybind()
-    lib.addKeybind({
+    if DoorKeybind then
+        DoorKeybind:disable(false)
+        return
+    end
+    DoorKeybind = lib.addKeybind({
         name = 'wiwang_door',
         description = L('keybind_door'),
         defaultKey = Wiwang.DoorKeybind,
         onPressed = function()
+            if S.lockMode == 'native' then return end
             local room = Rooms.Nearest(GetEntityCoords(cache.ped), 1.8)
             if room then OpenDoorMenu(room.id) end
         end,
@@ -333,8 +348,8 @@ end
 
 local function SetupReception()
     local r = Wiwang.Reception
-    if not r.enabled then return end
-    lib.points.new({
+    if not r.enabled or ReceptionPoint then return end
+    ReceptionPoint = lib.points.new({
         coords = r.coords,
         distance = r.distance,
         onEnter = function() AtReception = true; RefreshTextUI() end,
@@ -345,19 +360,45 @@ local function SetupReception()
     })
 end
 
---- decide once how doors are interacted with (needs the lock mode from the server)
+--- decide how doors are interacted with (needs the lock mode from the server); safe to call again
 local function SetupInteraction()
     if InteractionReady then return end
     InteractionReady = true
     S.target = ResolveTarget()
     if S.target ~= 'none' then
         SetupTarget(S.target)
-    elseif S.lockMode == 'ox_doorlock' then
-        SetupDoorKeybind() -- ox_doorlock already shows a text UI and uses [E] at these doors
     else
-        SetupDoorPoints()
+        -- ox_doorlock shows its own text UI at the door, so only the other modes get a prompt
+        if S.lockMode ~= 'ox_doorlock' then SetupDoorPoints() end
+        -- ox_doorlock and qb-doorlock both use [E] at the door: our door menu moves to the keybind
+        if S.lockMode ~= 'native' then SetupDoorKeybind() end
     end
     SetupReception()
+end
+
+local function TeardownInteraction()
+    if not InteractionReady then return end
+    InteractionReady = false
+    for i = 1, #DoorPoints do DoorPoints[i]:remove() end
+    DoorPoints = {}
+    CurrentDoor = nil
+    if DoorKeybind then DoorKeybind:disable(true) end
+    RemoveTarget(S.target)
+    S.target = 'none'
+end
+
+--- the server switched door-lock backend (a door-lock resource started after us)
+local function ApplyLockMode(mode)
+    if mode == S.lockMode then return end
+    S.lockMode = mode
+    if mode == 'native' then
+        RegisterDoors()
+    else
+        UnregisterDoors()
+    end
+    TeardownInteraction()
+    SetupInteraction()
+    RefreshTextUI()
 end
 
 ---------------------------------------------------------------------------------------------------
@@ -459,6 +500,7 @@ local function Init()
     S.mine = mine or nil
     S.access = access or {}
     S.lockMode = lockMode or 'native'
+    StateLoaded = true
     if S.lockMode == 'native' then
         if DoorsReady then for roomId in pairs(S.cache) do ApplyDoor(roomId) end else RegisterDoors() end
     else
@@ -477,6 +519,10 @@ RegisterNetEvent('QBCore:Client:OnPlayerUnload', function()
     S.access = {}
     RebuildZones()
     UpdateBlip()
+end)
+
+RegisterNetEvent('wiwang:client:lockMode', function(mode)
+    ApplyLockMode(mode)
 end)
 
 RegisterNetEvent('wiwang:client:setApartment', function(mine, access)
@@ -562,7 +608,10 @@ RegisterNetEvent('apartments:client:SpawnInApartment', function(roomId)
 end)
 
 RegisterNetEvent('qb-apartments:client:LastLocationHouse', function(_, roomId)
-    if roomId and S.cache[roomId] then EnterRoom(roomId) end
+    if not roomId or not S.cache[roomId] then return end
+    local timeout = GetGameTimer() + 10000
+    while not StateLoaded and GetGameTimer() < timeout do Wait(100) end
+    if S.access[roomId] then EnterRoom(roomId) end -- the room may have changed hands since the last session
 end)
 
 RegisterNetEvent('apartments:client:SetHomeBlip', function()
@@ -606,7 +655,7 @@ end)
 AddEventHandler('onResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
     UnregisterDoors()
-    RemoveTarget(S.target)
+    TeardownInteraction()
     for _, zone in pairs(Zones) do zone:remove() end
     lib.hideTextUI()
     if HomeBlip then RemoveBlip(HomeBlip) end

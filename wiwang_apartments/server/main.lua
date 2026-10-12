@@ -14,6 +14,7 @@ local OxStashes = {}  -- stash ids already registered with ox_inventory
 local InventoryType   -- resolved lazily, see DetectInventory()
 local KnockCooldown = {} -- src -> game time of the last knock
 local TotalRooms = Rooms.Floors * #Rooms.Template
+local running = Wiwang.Running
 
 local function Notify(src, msg, kind)
     TriggerClientEvent('QBCore:Notify', src, msg, kind or 'primary')
@@ -118,6 +119,7 @@ end
 --- lock / unlock through whichever door-lock backend is active
 ---@param src number|nil acting player (qb-doorlock needs one; any online player is used otherwise)
 local function SetLocked(rec, locked, src)
+    locked = locked == true
     local mode = DoorLock.mode
     if mode == 'ox_doorlock' then
         if DoorLock.OxSet(rec.id, locked) then return true end -- state comes back through ox_doorlock:stateChanged
@@ -160,12 +162,11 @@ local function Load()
             id = row.room, floor = row.floor, number = row.number, label = row.label, citizenid = row.citizenid,
             keys = row.keys and json.decode(row.keys) or {},
             furniture = row.furniture and json.decode(row.furniture) or nil,
-            locked = row.locked == 1,
+            locked = row.locked == true or row.locked == 1,
         }
         Data[rec.id] = rec
         ByCitizen[rec.citizenid] = rec.id
     end
-    Ready = true
     print(('^2[wiwang_apartments]^7 %d / %d rooms assigned, door locks: %s'):format(#rows, TotalRooms, DoorLock.mode))
 end
 
@@ -198,12 +199,17 @@ local function AssignRoom(citizenid, floor, number)
     local id = Rooms.RoomId(floor, number)
     if Data[id] then return nil, 'taken' end
     local rec = { id = id, floor = floor, number = number, label = Rooms.Label(floor, number), citizenid = citizenid, keys = {}, furniture = nil, locked = true }
-    MySQL.insert.await('INSERT INTO wiwang_apartments (room, floor, number, label, citizenid, `keys`, locked) VALUES (?, ?, ?, ?, ?, ?, 1)',
-        { id, floor, number, rec.label, citizenid, '[]' })
-    Data[id] = rec
+    Data[id] = rec            -- reserve before yielding so two logins cannot get the same room
     ByCitizen[citizenid] = id
+    local inserted = MySQL.insert.await('INSERT INTO wiwang_apartments (room, floor, number, label, citizenid, `keys`, locked) VALUES (?, ?, ?, ?, ?, ?, 1)',
+        { id, floor, number, rec.label, citizenid, '[]' })
+    if not inserted then
+        if Data[id] == rec then Data[id] = nil end
+        if ByCitizen[citizenid] == id then ByCitizen[citizenid] = nil end
+        return nil, 'db'
+    end
     if DoorLock.mode == 'ox_doorlock' then
-        DoorLock.OxCreate(rec, Characters(rec))
+        DoorLock.OxAssign(rec, Characters(rec))
     elseif DoorLock.mode == 'qb-doorlock' then
         DoorLock.QbSet(id, true, AnyOnlinePlayer(), true)
     end
@@ -224,17 +230,31 @@ local function DetectInventory()
     return InventoryType
 end
 
-local function ClearStash(roomId)
+local TableExists = {}
+local function HasTable(name)
+    if TableExists[name] == nil then
+        local row = MySQL.single.await('SELECT 1 AS ok FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?', { name })
+        TableExists[name] = row ~= nil
+    end
+    return TableExists[name]
+end
+
+--- wipe a room stash, whether or not the inventory resource has it loaded right now
+local function ClearStash(roomId, label)
     local stash = StashId(roomId)
     local inv = DetectInventory()
     if inv == 'ox_inventory' then
-        pcall(function() exports.ox_inventory:ClearInventory(stash) end)
-    elseif inv == 'qb-inventory' then
-        if not pcall(function() exports['qb-inventory']:ClearStash(stash) end) then
-            MySQL.query('DELETE FROM stashitems WHERE stash = ?', { stash })
-        end
+        pcall(function()
+            if not OxStashes[stash] then
+                exports.ox_inventory:RegisterStash(stash, label or stash, Wiwang.StashSlots, Wiwang.StashWeight, false)
+                OxStashes[stash] = true
+            end
+            exports.ox_inventory:ClearInventory(stash)
+        end)
     else
-        MySQL.query('DELETE FROM stashitems WHERE stash = ?', { stash })
+        pcall(function() exports['qb-inventory']:ClearStash(stash) end) -- in-memory copy (new qb-inventory)
+        if HasTable('inventories') then MySQL.query('DELETE FROM inventories WHERE identifier = ?', { stash }) end
+        if HasTable('stashitems') then MySQL.query('DELETE FROM stashitems WHERE stash = ?', { stash }) end
     end
 end
 
@@ -267,15 +287,16 @@ local function UnassignRoom(roomId)
     MySQL.query.await('DELETE FROM wiwang_apartments WHERE room = ?', { roomId })
     Data[roomId] = nil
     ByCitizen[rec.citizenid] = nil
-    if Wiwang.ClearStashOnUnassign then ClearStash(roomId) end
+    if Wiwang.ClearStashOnUnassign then ClearStash(roomId, rec.label) end
     if DoorLock.mode == 'ox_doorlock' then
-        DoorLock.OxRemove(roomId)
+        DoorLock.OxRelease(roomId)
     elseif DoorLock.mode == 'qb-doorlock' then
         DoorLock.QbSet(roomId, Wiwang.LockVacantRooms, AnyOnlinePlayer(), true)
     end
     Broadcast(roomId, nil)
     local Owner = QBCore.Functions.GetPlayerByCitizenId(rec.citizenid)
     if Owner then
+        SetInsideMeta(Owner, nil) -- otherwise "last location" would put them back into a room that is not theirs
         TriggerClientEvent('wiwang:client:setApartment', Owner.PlayerData.source, false, AccessList(rec.citizenid))
     end
     for i = 1, #rec.keys do PushAccess(rec.keys[i]) end
@@ -291,16 +312,18 @@ local function ValidFurniture(list)
         if type(f) ~= 'table' or type(f.model) ~= 'string' or #f.model == 0 or #f.model > 64 then return nil end
         local x, y, z, h = tonumber(f.x), tonumber(f.y), tonumber(f.z), tonumber(f.h) or 0.0
         if not x or not y or not z then return nil end
-        if math.abs(x) > 3.3 or math.abs(y) > 3.0 or z < -0.2 or z > 3.2 then return nil end -- must stay inside the room box
+        -- must stay inside the room box (written so that NaN fails too)
+        if not (x >= -3.3 and x <= 3.3 and y >= -3.0 and y <= 3.0 and z >= -0.2 and z <= 3.2 and h == h) then return nil end
         clean[i] = { model = f.model, x = x, y = y, z = z, h = h % 360.0 }
     end
     return clean
 end
 
 local function SaveFurniture(rec, list)
+    local encoded = list and json.encode(list) or nil
     rec.furniture = list
-    if list then
-        MySQL.update('UPDATE wiwang_apartments SET furniture = ? WHERE room = ?', { json.encode(list), rec.id })
+    if encoded then
+        MySQL.update('UPDATE wiwang_apartments SET furniture = ? WHERE room = ?', { encoded, rec.id })
     else
         MySQL.update('UPDATE wiwang_apartments SET furniture = NULL WHERE room = ?', { rec.id })
     end
@@ -319,6 +342,51 @@ local function OwnedRoom(src)
     return roomId and Data[roomId] or nil, cid
 end
 
+local function OpenStashFor(src, roomId)
+    local rec = Data[roomId]
+    local cid = Cid(src)
+    if not rec or not cid or not HasAccess(rec, cid) or not NearRoom(src, rec, 8.0) then return end
+    OpenStash(src, rec)
+end
+
+local function Knock(src, roomId)
+    local rec = Data[roomId]
+    if not rec or not NearRoom(src, rec, 12.0) then return end
+    local now = GetGameTimer()
+    if KnockCooldown[src] and now - KnockCooldown[src] < 5000 then return end
+    KnockCooldown[src] = now
+    Notify(src, L('knock_sent', rec.label))
+    local Owner = QBCore.Functions.GetPlayerByCitizenId(rec.citizenid)
+    if not Owner then return end
+    if Wiwang.KnockOpenTime > 0 and rec.locked then
+        TriggerClientEvent('wiwang:client:knock', Owner.PlayerData.source, rec.id)
+    else
+        Notify(Owner.PlayerData.source, L('knock_received', rec.label))
+    end
+end
+
+--- (re)resolve the door-lock backend; clients are told when it changes after startup
+local function ResolveMode()
+    local old = DoorLock.mode
+    local mode = DoorLock.Resolve()
+    if Ready and old ~= mode then
+        print(('^3[wiwang_apartments]^7 door locks switched from %s to %s'):format(old, mode))
+        TriggerClientEvent('wiwang:client:lockMode', -1, mode)
+    end
+    return mode
+end
+
+--- a character with no room gets the next free one
+local function AutoAssign(src, cid)
+    local rec, err = AssignRoom(cid)
+    if rec then
+        Notify(src, L('room_given', rec.label, rec.floor), 'success')
+    elseif err == 'full' then
+        Notify(src, L('hotel_full'), 'error')
+    end
+    return rec
+end
+
 local function SyncOxDoors()
     DoorLock.OxRegisterHook(Data, function(src, rec)
         local cid = Cid(src)
@@ -334,6 +402,7 @@ end
 MySQL.ready(function()
     DoorLock.Resolve()
     Load()
+    Ready = true
     if DoorLock.mode == 'ox_doorlock' then SyncOxDoors() end
     -- resource restarted while people are online: resend everybody their data
     for _, Player in pairs(QBCore.Functions.GetQBPlayers()) do
@@ -348,7 +417,7 @@ end)
 AddEventHandler('onResourceStart', function(res)
     if res ~= 'qb-doorlock' or not Ready then return end
     SetTimeout(3000, function()
-        if Wiwang.DoorLock == 'auto' then DoorLock.Resolve() end
+        if Wiwang.DoorLock == 'auto' then ResolveMode() end
         DoorLock.QbInitialSync(Data, AnyOnlinePlayer())
     end)
 end)
@@ -356,7 +425,7 @@ end)
 -- ox_doorlock (re)started after us: hook and doors need to be registered again
 AddEventHandler('ox_doorlock:loaded', function()
     if not Ready then return end
-    if DoorLock.mode == 'ox_doorlock' or (Wiwang.DoorLock == 'auto' and DoorLock.Resolve() == 'ox_doorlock') then
+    if DoorLock.mode == 'ox_doorlock' or (Wiwang.DoorLock == 'auto' and ResolveMode() == 'ox_doorlock') then
         SyncOxDoors()
     end
 end)
@@ -366,16 +435,24 @@ AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
     local cid = Player.PlayerData.citizenid
     while not Ready do Wait(100) end
     if Wiwang.AutoAssignOnLoad and not ByCitizen[cid] then
-        local rec, err = AssignRoom(cid)
-        if rec then
-            Notify(src, L('room_given', rec.label, rec.floor), 'success')
-        elseif err == 'full' then
-            Notify(src, L('hotel_full'), 'error')
+        if Apartments.Starting then
+            -- qb-core fires PlayerLoaded during login, before qb-spawn shows the apartment choice:
+            -- wait so apartments:server:CreateApartment (spawn inside the room) can run first
+            SetTimeout(Wiwang.AutoAssignDelay * 1000, function()
+                local Still = QBCore.Functions.GetPlayer(src)
+                if Still and Still.PlayerData.citizenid == cid and not ByCitizen[cid] then AutoAssign(src, cid) end
+            end)
+        else
+            AutoAssign(src, cid)
         end
     end
     local roomId = ByCitizen[cid]
     TriggerClientEvent('wiwang:client:setApartment', src, roomId and OwnerView(Data[roomId]) or false, AccessList(cid))
     DoorLock.QbInitialSync(Data, src)
+end)
+
+AddEventHandler('playerDropped', function()
+    KnockCooldown[source] = nil
 end)
 
 lib.callback.register('wiwang:getState', function(source)
@@ -424,20 +501,7 @@ RegisterNetEvent('wiwang:server:setLock', function(roomId, locked)
 end)
 
 RegisterNetEvent('wiwang:server:knock', function(roomId)
-    local src = source
-    local rec = Data[roomId]
-    if not rec or not NearRoom(src, rec, 12.0) then return end
-    local now = GetGameTimer()
-    if KnockCooldown[src] and now - KnockCooldown[src] < 5000 then return end
-    KnockCooldown[src] = now
-    Notify(src, L('knock_sent', rec.label))
-    local Owner = QBCore.Functions.GetPlayerByCitizenId(rec.citizenid)
-    if not Owner then return end
-    if Wiwang.KnockOpenTime > 0 and rec.locked then
-        TriggerClientEvent('wiwang:client:knock', Owner.PlayerData.source, rec.id)
-    else
-        Notify(Owner.PlayerData.source, L('knock_received', rec.label))
-    end
+    Knock(source, roomId)
 end)
 
 --- owner accepted a knock: unlock, lock again after Wiwang.KnockOpenTime seconds
@@ -458,11 +522,7 @@ RegisterNetEvent('wiwang:server:openForVisitor', function(roomId)
 end)
 
 RegisterNetEvent('wiwang:server:openStash', function(roomId)
-    local src = source
-    local rec = Data[roomId]
-    local cid = Cid(src)
-    if not rec or not cid or not HasAccess(rec, cid) or not NearRoom(src, rec, 8.0) then return end
-    OpenStash(src, rec)
+    OpenStashFor(source, roomId)
 end)
 
 RegisterNetEvent('wiwang:server:giveKey', function(targetId)
@@ -599,15 +659,11 @@ RegisterNetEvent('apartments:server:setCurrentApartment', function(ap)
 end)
 
 RegisterNetEvent('apartments:server:openStash', function(roomId)
-    local src = source
-    local rec = Data[roomId]
-    local cid = Cid(src)
-    if not rec or not cid or not HasAccess(rec, cid) or not NearRoom(src, rec, 8.0) then return end
-    OpenStash(src, rec)
+    OpenStashFor(source, roomId)
 end)
 
 RegisterNetEvent('apartments:server:RingDoor', function(roomId)
-    TriggerEvent('wiwang:server:knock', roomId)
+    Knock(source, roomId)
 end)
 
 QBCore.Functions.CreateCallback('apartments:GetOwnedApartment', function(source, cb, cid)
@@ -685,7 +741,14 @@ QBCore.Commands.Add('wiwang_free', 'How many Wiwang Hotel rooms are free (admin)
     Notify(source, L('rooms_summary', used, TotalRooms, TotalRooms - used))
 end, Wiwang.AdminPermission)
 
-QBCore.Commands.Add('wiwang_doorlock', 'Show the door-lock backend and resync its doors (admin)', {}, false, function(source)
+QBCore.Commands.Add('wiwang_doorlock', 'Door-lock backend: show + resync, or "cleanup" to delete the hotel doors from ox_doorlock (admin)', {
+    { name = 'action', help = '(empty) = resync | cleanup' },
+}, false, function(source, args)
+    if args[1] == 'cleanup' and running('ox_doorlock') then
+        local removed, restart = DoorLock.OxRemoveAll()
+        return Notify(source, L('doorlock_cleanup', removed) .. (restart and (' ' .. L('doorlock_restart')) or ''))
+    end
+    ResolveMode()
     if DoorLock.mode == 'ox_doorlock' then
         SyncOxDoors()
     elseif DoorLock.mode == 'qb-doorlock' then

@@ -18,7 +18,7 @@ Wiwang.Strings = {
     already_have_room = 'You already have %s',
     single_hotel = 'There is only one Wiwang Hotel; ask an admin to move rooms',
     -- doors
-    door_prompt = '[E] %s - %s',
+    door_prompt = '[%s] %s - %s',
     door_locked = '%s locked',
     door_unlocked = '%s unlocked',
     knock_sent = 'You knock on the door of %s',
@@ -43,7 +43,7 @@ Wiwang.Strings = {
     logout = 'Log out',
     logout_desc = 'Back to character selection',
     logout_confirm = 'Go back to character selection?',
-    room_menu_prompt = '[E] %s menu',
+    room_menu_prompt = '[%s] %s menu',
     -- keys
     give_key = 'Give a key',
     give_key_desc = 'Enter the server id of the player',
@@ -72,7 +72,7 @@ Wiwang.Strings = {
     furni_not_inside = 'Stand inside your own room first',
     -- reception
     reception = 'Reception',
-    reception_prompt = '[E] Reception',
+    reception_prompt = '[%s] Reception',
     check_in = 'Check in',
     check_in_desc = 'Get a room at the hotel',
     my_room = 'Where is my room?',
@@ -89,6 +89,8 @@ Wiwang.Strings = {
     room_freed = '%s is free again',
     rooms_summary = '%d of %d rooms assigned, %d free',
     doorlock_mode = 'Door locks: %s (target: %s)',
+    doorlock_cleanup = 'Removed %d hotel doors from ox_doorlock.',
+    doorlock_restart = 'Restart ox_doorlock to apply.',
 }
 
 --- translate a key, formatting with the extra arguments

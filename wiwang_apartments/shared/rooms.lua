@@ -3,6 +3,11 @@
 -- Each of the 19 rooms is the same layout rotated by `rotation` degrees around its centre.
 -- In the un-rotated (rotation = 0) layout the door is on the -X wall and the room extends towards +X.
 Rooms = Rooms or {}
+
+--- is a resource started (or starting)?
+function Wiwang.Running(res)
+    return (GetResourceState(res) or ''):find('start') ~= nil
+end
 Rooms.Floors = 20
 Rooms.FloorHeight = 3.8
 Rooms.Base = vec3(-823.606079, -708.511169, 42.382652) -- MLO origin of floor 1 (floky_wiwang_hotel_01_milo_)
@@ -86,13 +91,6 @@ function Rooms.Get(floor, number)
     }
 end
 
---- axis-aligned test (the MLO is not rotated, so room boxes are world-axis-aligned)
-function Rooms.IsInside(room, coords)
-    return coords.x >= room.bbMin.x and coords.x <= room.bbMax.x
-        and coords.y >= room.bbMin.y and coords.y <= room.bbMax.y
-        and coords.z >= room.bbMin.z - 0.5 and coords.z <= room.bbMax.z + 0.5
-end
-
 --- room-local furniture coords -> world position + heading
 function Rooms.ToWorld(room, lx, ly, lz, lh)
     local x, y = Rooms.Rotate(lx, ly, room.rotation)
@@ -112,7 +110,7 @@ function Rooms.FloorAt(coords)
     if lx < b.min.x or lx > b.max.x or ly < b.min.y or ly > b.max.y then return nil end
     local rel = coords.z - (Rooms.Base.z + b.min.z) -- height above the floor level of floor 1
     if rel < -0.5 then return nil end
-    local floor = math.floor(rel / Rooms.FloorHeight) + 1
+    local floor = math.floor(math.max(rel, 0.0) / Rooms.FloorHeight) + 1
     if floor > Rooms.Floors then return nil end
     return floor
 end

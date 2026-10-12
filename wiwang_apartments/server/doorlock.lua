@@ -2,19 +2,22 @@
     Door-lock backend adapter (server)
 
     native      -> this resource tells clients the lock state, clients drive the native door system
-    ox_doorlock -> one ox_doorlock door per assigned room (name = roomId); authorisation through the
-                   doorAuthorization hook, state changes come back through ox_doorlock:stateChanged
+    ox_doorlock -> one ox_doorlock door per hotel room (name = roomId), created once for all 380 rooms.
+                   Owner + key holders are the door's `characters` and are also authorised through the
+                   doorAuthorization hook (ox_doorlock does not bridge qb-core itself). Lock changes
+                   come back through ox_doorlock:stateChanged.
+                   Overextended builds expose createDoor; the CommunityOx fork does not, so there the
+                   rows are inserted into the ox_doorlock table and ox_doorlock must be restarted once.
     qb-doorlock -> doors come from doorlock/qb-doorlock/wiwang_hotel.lua (static config, id = roomId);
                    this resource flips their state with qb-doorlock:server:updateState (unlockAnyway)
 ]]
-DoorLock = { mode = 'native' }
+DoorLock = { mode = 'native', oxCreateExport = nil }
 
 local OxIds, ByOxId, Override = {}, {}, {}
 local hookRegistered, syncing, qbSynced = false, false, false
-
-local function running(res)
-    return (GetResourceState(res) or ''):find('start') ~= nil
-end
+local oxPendingRestart = 0
+local warned = {}
+local running = Wiwang.Running
 
 function DoorLock.Resolve()
     local want = Wiwang.DoorLock
@@ -32,44 +35,56 @@ end
 -- ox_doorlock
 ---------------------------------------------------------------------------------------------------
 
-local function oxData(rec, room, characters)
+local function oxData(room, locked, characters)
     return {
-        name = rec.id,
+        name = room.id,
         model = Rooms.DoorModel,
         coords = { x = room.door.x, y = room.door.y, z = room.door.z },
         heading = room.doorHeading,
-        state = rec.locked and 1 or 0,
+        state = locked and 1 or 0,
         characters = characters,
         maxDistance = 2.0,
     }
 end
 
+--- call an ox_doorlock export; returns ok, result. A missing export is reported as ok = false, 'missing'.
 local function oxCall(fn, ...)
-    local args = { ... }
-    local ok, res = pcall(function() return exports.ox_doorlock[fn](exports.ox_doorlock, table.unpack(args)) end)
-    if not ok then print(('^3[wiwang_apartments]^7 ox_doorlock:%s failed: %s'):format(fn, res)) end
-    return ok, res
-end
-
-function DoorLock.OxCreate(rec, characters)
-    local room = Rooms.Get(rec.floor, rec.number)
-    local ok, id = oxCall('createDoor', oxData(rec, room, characters))
-    if ok and id then
-        OxIds[rec.id], ByOxId[id] = id, rec.id
+    local args = table.pack(...)
+    local ok, res = pcall(function() return exports.ox_doorlock[fn](exports.ox_doorlock, table.unpack(args, 1, args.n)) end)
+    if ok then return true, res end
+    local missing = tostring(res):find('No such export') ~= nil
+    if not warned[fn] then
+        warned[fn] = true
+        print(('^3[wiwang_apartments]^7 ox_doorlock:%s %s'):format(fn, missing and 'is not available in this ox_doorlock build' or ('failed: ' .. tostring(res))))
     end
-    return ok and id or nil
+    return false, missing and 'missing' or res
 end
 
-function DoorLock.OxRemove(roomId)
-    local id = OxIds[roomId]
-    if not id then return end
-    OxIds[roomId], ByOxId[id] = nil, nil
-    oxCall('removeDoor', id)
+local function sameList(a, b)
+    if #a ~= #b then return false end
+    local set = {}
+    for i = 1, #a do set[a[i]] = true end
+    for i = 1, #b do
+        if not set[b[i]] then return false end
+    end
+    return true
 end
 
-function DoorLock.OxUpdateCharacters(rec, characters)
-    local id = OxIds[rec.id]
-    if id then oxCall('editDoor', id, { characters = characters }) end
+--- create the ox_doorlock door of one room: export when available, otherwise a DB row (restart needed)
+local function oxCreateDoor(room, locked, characters)
+    local data = oxData(room, locked, characters)
+    if DoorLock.oxCreateExport ~= false then
+        local ok, id = oxCall('createDoor', data)
+        if ok and id then
+            DoorLock.oxCreateExport = true
+            return id
+        end
+        if ok or id ~= 'missing' then return nil end
+        DoorLock.oxCreateExport = false
+    end
+    local id = MySQL.insert.await('INSERT INTO ox_doorlock (name, data) VALUES (?, ?)', { room.id, json.encode(data) })
+    if id then oxPendingRestart = oxPendingRestart + 1 end
+    return id
 end
 
 --- change a door from the server: the authorisation hook lets it through while Override is set
@@ -82,36 +97,86 @@ function DoorLock.OxSet(roomId, locked)
     return ok and res == true
 end
 
+function DoorLock.OxUpdateCharacters(rec, characters)
+    local id = OxIds[rec.id]
+    if id then oxCall('editDoor', id, { characters = characters }) end
+end
+
+--- room assigned: hand the door to its owner and lock it
+function DoorLock.OxAssign(rec, characters)
+    DoorLock.OxUpdateCharacters(rec, characters)
+    DoorLock.OxSet(rec.id, true)
+end
+
+--- room freed: nobody owns the door any more
+function DoorLock.OxRelease(roomId)
+    local id = OxIds[roomId]
+    if not id then return end
+    oxCall('editDoor', id, { characters = {} })
+    DoorLock.OxSet(roomId, Wiwang.LockVacantRooms)
+end
+
 function DoorLock.OxRoom(oxId)
     return ByOxId[oxId]
 end
 
---- create / update / remove ox_doorlock doors so they match the assigned rooms
+--- make sure every hotel room has an ox_doorlock door and that owners / states match our records
 ---@param rooms table roomId -> rec
 ---@param characters fun(rec: table): string[]
----@param onState fun(rec: table, locked: boolean)  ox_doorlock is the source of truth for the state
+---@param onState fun(rec: table, locked: boolean)  ox_doorlock is the source of truth for assigned rooms
 function DoorLock.OxSync(rooms, characters, onState)
     if DoorLock.mode ~= 'ox_doorlock' or syncing then return end
     syncing = true
     local rows = MySQL.query.await("SELECT `id`, `name` FROM `ox_doorlock` WHERE `name` LIKE 'wiwang\\_%'") or {}
     local known = {}
     for i = 1, #rows do known[rows[i].name] = rows[i].id end
-    for roomId, rec in pairs(rooms) do
-        local id = known[roomId]
-        if id then
-            known[roomId] = nil
-            OxIds[roomId], ByOxId[id] = id, roomId
-            oxCall('editDoor', id, { characters = characters(rec) })
-            local ok, door = oxCall('getDoor', id)
-            if ok and door and door.state ~= nil then onState(rec, door.state == 1) end
-        else
-            DoorLock.OxCreate(rec, characters(rec))
+    local created, pending = 0, {}
+    for floor = 1, Rooms.Floors do
+        for number = 1, #Rooms.Template do
+            local room = Rooms.Get(floor, number)
+            local rec = rooms[room.id]
+            local chars = rec and characters(rec) or {}
+            local wantLocked = rec and rec.locked or (not rec and Wiwang.LockVacantRooms)
+            local id = known[room.id]
+            if not id then
+                id = oxCreateDoor(room, wantLocked, chars)
+                if id then created = created + 1 end
+            else
+                local ok, door = oxCall('getDoor', id) -- false until ox_doorlock has finished loading
+                if ok and door then
+                    if not sameList(door.characters or {}, chars) then oxCall('editDoor', id, { characters = chars }) end
+                    if rec then
+                        if door.state ~= nil then onState(rec, door.state == 1) end
+                    elseif (door.state == 1) ~= (wantLocked == true) then
+                        pending[#pending + 1] = { room.id, wantLocked }
+                    end
+                end
+            end
+            if id then OxIds[room.id], ByOxId[id] = id, room.id end
         end
     end
-    for _, id in pairs(known) do -- doors of rooms that are no longer assigned
-        oxCall('removeDoor', id)
+    for i = 1, #pending do DoorLock.OxSet(pending[i][1], pending[i][2]) end
+    if created > 0 then print(('^2[wiwang_apartments]^7 created %d ox_doorlock doors for the hotel rooms'):format(created)) end
+    if oxPendingRestart > 0 then
+        print(('^3[wiwang_apartments]^7 %d hotel doors were written straight into the ox_doorlock table (this ox_doorlock build has no createDoor export). Restart ox_doorlock once to load them.'):format(oxPendingRestart))
     end
     syncing = false
+end
+
+--- remove every hotel door from ox_doorlock (switching back to another mode)
+function DoorLock.OxRemoveAll()
+    local removed = 0
+    local rows = MySQL.query.await("SELECT `id` FROM `ox_doorlock` WHERE `name` LIKE 'wiwang\\_%'") or {}
+    for i = 1, #rows do
+        local ok, res = oxCall('removeDoor', rows[i].id)
+        if not ok and res == 'missing' then
+            MySQL.query.await('DELETE FROM ox_doorlock WHERE id = ?', { rows[i].id })
+            oxPendingRestart = oxPendingRestart + 1
+        end
+        removed = removed + 1
+    end
+    OxIds, ByOxId = {}, {}
+    return removed, oxPendingRestart > 0
 end
 
 ---@param rooms table roomId -> rec (live table)
@@ -121,16 +186,24 @@ function DoorLock.OxRegisterHook(rooms, hasAccess)
     local ok = oxCall('registerHook', 'doorAuthorization', function(payload)
         local door = payload.door
         local rec = door and door.name and rooms[door.name]
-        if not rec then return end            -- not one of our doors: leave ox_doorlock's decision alone
+        if not rec then
+            -- a vacant hotel door or not ours at all: leave ox_doorlock's own decision alone
+            if door and door.name and door.name:find('^wiwang_') and Override[door.name] then return true end
+            return
+        end
         if Override[rec.id] then return true end
-        if payload.lockpick then return end   -- lockpicking stays whatever ox_doorlock decided
+        if payload.lockpick then return end
         return hasAccess(payload.source, rec) or false
     end, { nameFilter = '^wiwang_' })
     hookRegistered = ok
 end
 
 AddEventHandler('onResourceStart', function(res)
-    if res == 'ox_doorlock' then hookRegistered = false end
+    if res == 'ox_doorlock' then
+        hookRegistered = false
+        oxPendingRestart = 0
+        OxIds, ByOxId = {}, {}
+    end
     if res == 'qb-doorlock' then qbSynced = false end
 end)
 
@@ -140,8 +213,8 @@ end)
 
 --- qb-doorlock needs an online player id to accept a state change
 function DoorLock.QbSet(roomId, locked, src, silent)
-    if not src then return false end
-    TriggerEvent('qb-doorlock:server:updateState', roomId, locked, false, false, true, not silent, not silent, src)
+    if not src or not running('qb-doorlock') then return false end
+    TriggerEvent('qb-doorlock:server:updateState', roomId, locked == true, false, false, true, not silent, not silent, src)
     return true
 end
 
