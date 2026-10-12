@@ -96,16 +96,29 @@ function onElevatorExit(self)
     lib.hideTextUI()
 end
  
+--- floor of the player's own apartment when wiwang_apartments (or its qb-apartments rename) is running
+local function myRoom()
+    for _, res in ipairs({ 'wiwang_apartments', 'qb-apartments' }) do
+        if GetResourceState(res) == 'started' then
+            local ok, room = pcall(function() return exports[res]:GetMyRoom() end)
+            if ok and type(room) == 'table' then return room end
+        end
+    end
+end
+
 function ElevatorNearby(self)
     if self.currentDistance < self.distance and IsControlJustReleased(0, 38) then
         local elements = {}
         local pedcoords = GetEntityCoords(cache.ped)
+        local room = myRoom()
         for i = 1, #floors do
             local floor = floors[i]
             local currentFloor = #(pedcoords - vec3(floor.coords.x, floor.coords.y, floor.coords.z)) < 1.0
+            local mine = room and room.floor == i - 1 -- floors[1] is the lobby
             elements[#elements + 1] = {
-                title = floor.label,
+                title = floor.label .. (mine and (' - ' .. room.label) or ''),
                 description = currentFloor and 'You are here' or 'Go to ' .. floor.label,
+                icon = mine and 'house' or nil,
                 disabled = currentFloor,
                 onSelect = function()
                     DoScreenFadeOut(800)
